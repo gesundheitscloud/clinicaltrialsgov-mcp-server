@@ -216,7 +216,7 @@ export function createHttpApp(
       sessionIdGenerator: () => generateSecureSessionId(),
       enableDnsRebindingProtection: dnsProtectionEnabled,
       ...(allowedOriginsList ? { allowedOrigins: allowedOriginsList } : {}),
-      onsessioninitialized: async (sessionId: string) => {
+      onsessioninitialized: (sessionId: string) => {
         sessionTransports.set(sessionId, transport);
         sessionStore.getOrCreate(sessionId, identity);
         logger.info('Initialized stateful MCP session.', {
@@ -225,7 +225,7 @@ export function createHttpApp(
           ...(identity?.tenantId ? { tenantId: identity.tenantId } : {}),
         });
       },
-      onsessionclosed: async (sessionId: string | undefined) => {
+      onsessionclosed: (sessionId: string | undefined) => {
         if (sessionId) {
           sessionTransports.delete(sessionId);
           sessionStore.terminate(sessionId);
