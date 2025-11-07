@@ -1,22 +1,24 @@
 /**
  * @fileoverview Configures and starts the HTTP MCP transport using Hono.
- * This implementation uses the official @hono/mcp package for a fully
- * web-standard, platform-agnostic transport layer.
+ * This implementation now relies on the official MCP TypeScript SDK
+ * `StreamableHTTPServerTransport`, ensuring feature parity with the spec.
  *
  * Implements MCP Specification 2025-06-18 Streamable HTTP Transport.
  * @see {@link https://modelcontextprotocol.io/specification/2025-06-18/basic/transports#streamable-http | MCP Streamable HTTP Transport}
  * @module src/mcp-server/transports/http/httpTransport
  */
-import { StreamableHTTPTransport } from '@hono/mcp';
 import { type ServerType, serve } from '@hono/node-server';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
-import http from 'http';
+import http, { type IncomingMessage } from 'http';
 
 import { config } from '@/config/index.js';
 import {
   authContext,
+  type AuthInfo,
   createAuthMiddleware,
   createAuthStrategy,
 } from '@/mcp-server/transports/auth/index.js';
@@ -33,17 +35,9 @@ import {
   logStartupBanner,
 } from '@/utils/index.js';
 
-/**
- * Extends the base StreamableHTTPTransport to include a session ID.
- */
-class McpSessionTransport extends StreamableHTTPTransport {
-  public sessionId: string;
+const HONO_ALREADY_SENT_HEADER = 'x-hono-already-sent';
 
-  constructor(sessionId: string) {
-    super();
-    this.sessionId = sessionId;
-  }
-}
+type IncomingMessageWithAuth = IncomingMessage & { auth?: AuthInfo };
 
 export function createHttpApp(
   mcpServer: McpServer,
@@ -55,23 +49,25 @@ export function createHttpApp(
     component: 'HttpTransportSetup',
   };
 
-  // Initialize session store for stateful mode
-  const sessionStore =
-    config.mcpSessionMode === 'stateful'
-      ? new SessionStore(config.mcpStatefulSessionStaleTimeoutMs)
-      : null;
+  const isStatefulMode = config.mcpSessionMode === 'stateful';
+  const sessionStore = isStatefulMode
+    ? new SessionStore(config.mcpStatefulSessionStaleTimeoutMs)
+    : null;
+  const sessionTransports = new Map<string, StreamableHTTPServerTransport>();
 
-  // CORS (with permissive fallback)
-  const allowedOrigin =
+  const allowedOriginsList =
     Array.isArray(config.mcpAllowedOrigins) &&
     config.mcpAllowedOrigins.length > 0
       ? config.mcpAllowedOrigins
-      : '*';
+      : undefined;
+  const corsOrigin = allowedOriginsList ?? '*';
+  const dnsProtectionEnabled =
+    Array.isArray(allowedOriginsList) && allowedOriginsList.length > 0;
 
   app.use(
     '*',
     cors({
-      origin: allowedOrigin,
+      origin: corsOrigin,
       allowMethods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
       allowHeaders: [
         'Content-Type',
@@ -91,16 +87,15 @@ export function createHttpApp(
   // https://modelcontextprotocol.io/specification/2025-06-18/basic/transports#security-warning
   app.use(config.mcpHttpEndpointPath, async (c, next) => {
     const origin = c.req.header('origin');
-    if (origin) {
+    if (origin && dnsProtectionEnabled) {
       const isAllowed =
-        allowedOrigin === '*' ||
-        (Array.isArray(allowedOrigin) && allowedOrigin.includes(origin));
+        allowedOriginsList === undefined || allowedOriginsList.includes(origin);
 
       if (!isAllowed) {
         logger.warning('Rejected request with invalid Origin header', {
           ...transportContext,
           origin,
-          allowedOrigins: allowedOrigin,
+          allowedOrigins: allowedOriginsList,
         });
         return c.json(
           { error: 'Invalid origin. DNS rebinding protection.' },
@@ -158,7 +153,12 @@ export function createHttpApp(
     return c.json(metadata);
   });
 
-  app.get(config.mcpHttpEndpointPath, (c) => {
+  app.get(config.mcpHttpEndpointPath, async (c, next) => {
+    const acceptHeader = c.req.header('accept') ?? '';
+    if (acceptHeader.includes('text/event-stream')) {
+      return await next();
+    }
+
     return c.json({
       status: 'ok',
       server: {
@@ -170,41 +170,6 @@ export function createHttpApp(
         sessionMode: config.mcpSessionMode,
       },
     });
-  });
-
-  // MCP Spec 2025-06-18: DELETE endpoint for session termination
-  // Clients SHOULD send DELETE to explicitly terminate sessions
-  // https://modelcontextprotocol.io/specification/2025-06-18/basic/transports#session-management
-  app.delete(config.mcpHttpEndpointPath, (c) => {
-    const sessionId = c.req.header('mcp-session-id');
-
-    if (!sessionId) {
-      logger.warning('DELETE request without session ID', transportContext);
-      return c.json({ error: 'Mcp-Session-Id header required' }, 400);
-    }
-
-    logger.info('Session termination requested', {
-      ...transportContext,
-      sessionId,
-    });
-
-    // For stateless mode or if session management is disabled, return 405
-    if (config.mcpSessionMode === 'stateless' || !sessionStore) {
-      return c.json(
-        { error: 'Session termination not supported in stateless mode' },
-        405,
-      );
-    }
-
-    // Terminate the session in the store
-    sessionStore.terminate(sessionId);
-
-    logger.info('Session terminated successfully', {
-      ...transportContext,
-      sessionId,
-    });
-
-    return c.json({ status: 'terminated', sessionId }, 200);
   });
 
   // Create auth strategy and middleware if auth is enabled
@@ -223,123 +188,226 @@ export function createHttpApp(
     );
   }
 
-  // JSON-RPC over HTTP (Streamable)
+  const createStatelessTransport = () => {
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined,
+      enableDnsRebindingProtection: dnsProtectionEnabled,
+      ...(allowedOriginsList ? { allowedOrigins: allowedOriginsList } : {}),
+    });
+    transport.onerror = (error) => {
+      logger.error('HTTP transport error (stateless).', {
+        ...transportContext,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    };
+    return transport;
+  };
+
+  const createStatefulTransport = (
+    identity: SessionIdentity | undefined,
+  ): StreamableHTTPServerTransport => {
+    if (!sessionStore) {
+      throw new Error(
+        'Session store is not initialized but stateful transport was requested.',
+      );
+    }
+
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => generateSecureSessionId(),
+      enableDnsRebindingProtection: dnsProtectionEnabled,
+      ...(allowedOriginsList ? { allowedOrigins: allowedOriginsList } : {}),
+      onsessioninitialized: async (sessionId: string) => {
+        sessionTransports.set(sessionId, transport);
+        sessionStore.getOrCreate(sessionId, identity);
+        logger.info('Initialized stateful MCP session.', {
+          ...transportContext,
+          sessionId,
+          ...(identity?.tenantId ? { tenantId: identity.tenantId } : {}),
+        });
+      },
+      onsessionclosed: async (sessionId: string | undefined) => {
+        if (sessionId) {
+          sessionTransports.delete(sessionId);
+          sessionStore.terminate(sessionId);
+        }
+        logger.info('Closed stateful MCP session.', {
+          ...transportContext,
+          sessionId,
+        });
+      },
+    });
+
+    transport.onerror = (error) => {
+      logger.error('HTTP transport error (stateful).', {
+        ...transportContext,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    };
+
+    return transport;
+  };
+
+  // JSON-RPC over HTTP (Streamable) using the official SDK transport
   app.all(config.mcpHttpEndpointPath, async (c) => {
-    const protocolVersion =
-      c.req.header('mcp-protocol-version') ?? '2025-03-26';
+    const method = c.req.method.toUpperCase();
+    const providedSessionId = c.req.header('mcp-session-id');
+    const nodeReq = c.env.incoming as IncomingMessageWithAuth | undefined;
+    const nodeRes = c.env.outgoing;
+
+    if (!nodeReq || !nodeRes) {
+      throw new Error('HTTP bindings not available for MCP transport.');
+    }
+
     logger.debug('Handling MCP request.', {
       ...transportContext,
       path: c.req.path,
-      method: c.req.method,
-      protocolVersion,
+      method,
+      providedSessionId,
     });
 
-    // Per MCP Spec 2025-06-18: MCP-Protocol-Version header MUST be validated
-    // Server MUST respond with 400 Bad Request for unsupported versions
-    // We default to 2025-03-26 for backward compatibility if not provided
-    const supportedVersions = ['2025-03-26', '2025-06-18'];
-    if (!supportedVersions.includes(protocolVersion)) {
-      logger.warning('Unsupported MCP protocol version requested.', {
-        ...transportContext,
-        protocolVersion,
-        supportedVersions,
-      });
-      return c.json(
-        {
-          error: 'Unsupported MCP protocol version',
-          protocolVersion,
-          supportedVersions,
-        },
-        400,
-      );
-    }
-
-    const providedSessionId = c.req.header('mcp-session-id');
-    const sessionId = providedSessionId ?? generateSecureSessionId();
-
-    // Extract identity from auth context (if auth is enabled)
-    // This MUST happen before session validation for security
     const authStore = authContext.getStore();
-    let sessionIdentity: SessionIdentity | undefined;
-    if (authStore?.authInfo) {
-      // Build identity object conditionally to satisfy exactOptionalPropertyTypes
-      sessionIdentity = {};
-      if (authStore.authInfo.tenantId)
-        sessionIdentity.tenantId = authStore.authInfo.tenantId;
-      if (authStore.authInfo.clientId)
-        sessionIdentity.clientId = authStore.authInfo.clientId;
-      if (authStore.authInfo.subject)
-        sessionIdentity.subject = authStore.authInfo.subject;
-    }
+    const sessionIdentity = extractSessionIdentity(authStore?.authInfo);
 
-    // MCP Spec 2025-06-18: Return 404 for invalid/terminated sessions
-    // https://modelcontextprotocol.io/specification/2025-06-18/basic/transports#session-management
-    // SECURITY: Validate session WITH identity binding to prevent hijacking
-    if (
-      sessionStore &&
-      providedSessionId &&
-      !sessionStore.isValidForIdentity(providedSessionId, sessionIdentity)
-    ) {
-      logger.warning(
-        'Session validation failed - invalid or hijacked session',
-        {
+    let parsedBody: unknown;
+    if (method === 'POST') {
+      try {
+        parsedBody = await c.req.json();
+      } catch (error) {
+        logger.warning('Invalid JSON payload received for MCP request.', {
           ...transportContext,
-          sessionId: providedSessionId,
-          requestTenant: sessionIdentity?.tenantId,
-          requestClient: sessionIdentity?.clientId,
-        },
-      );
-      return c.json({ error: 'Session not found or expired' }, 404);
-    }
-
-    // Create or update session for stateful mode WITH identity binding
-    if (sessionStore) {
-      sessionStore.getOrCreate(sessionId, sessionIdentity);
-    }
-
-    const transport = new McpSessionTransport(sessionId);
-
-    const handleRpc = async (): Promise<Response> => {
-      await mcpServer.connect(transport);
-      const response = await transport.handleRequest(c);
-
-      // MCP Spec 2025-06-18: For stateful sessions, return Mcp-Session-Id header
-      // in InitializeResponse (and all subsequent responses)
-      if (response && config.mcpSessionMode === 'stateful') {
-        response.headers.set('Mcp-Session-Id', sessionId);
-        logger.debug('Added Mcp-Session-Id header to response', {
-          ...transportContext,
-          sessionId,
+          error: error instanceof Error ? error.message : String(error),
         });
+        return c.json(
+          { error: 'Invalid JSON payload. Ensure the body is valid JSON.' },
+          400,
+        );
+      }
+    }
+
+    const resolveTransportForRequest = () => {
+      type Resolution =
+        | { response: Response }
+        | { transport: StreamableHTTPServerTransport; created: boolean };
+
+      if (!isStatefulMode) {
+        if (method === 'DELETE') {
+          return {
+            response: c.json(
+              { error: 'Session termination not supported in stateless mode' },
+              405,
+            ),
+          } satisfies Resolution;
+        }
+
+        return {
+          transport: createStatelessTransport(),
+          created: true,
+        } satisfies Resolution;
       }
 
-      if (response) {
-        return response;
+      if (!sessionStore) {
+        throw new Error('Stateful session mode requires a session store.');
       }
-      return c.body(null, 204);
+
+      if (providedSessionId) {
+        const isValid = sessionStore.isValidForIdentity(
+          providedSessionId,
+          sessionIdentity,
+        );
+
+        if (!isValid) {
+          logger.warning('Session validation failed.', {
+            ...transportContext,
+            sessionId: providedSessionId,
+            ...(sessionIdentity?.tenantId
+              ? { tenantId: sessionIdentity.tenantId }
+              : {}),
+          });
+          return {
+            response: c.json({ error: 'Session not found or expired' }, 404),
+          } satisfies Resolution;
+        }
+
+        const existingTransport = sessionTransports.get(providedSessionId);
+        if (!existingTransport) {
+          return {
+            response: c.json({ error: 'Session not found or expired' }, 404),
+          } satisfies Resolution;
+        }
+
+        sessionStore.getOrCreate(providedSessionId, sessionIdentity);
+        return { transport: existingTransport, created: false } satisfies Resolution;
+      }
+
+      if (method !== 'POST') {
+        return {
+          response: c.json(
+            { error: 'Mcp-Session-Id header required for this request' },
+            400,
+          ),
+        } satisfies Resolution;
+      }
+
+      if (!isInitializationPayload(parsedBody)) {
+        return {
+          response: c.json(
+            {
+              error:
+                'Initialization request required to create a new MCP session.',
+            },
+            400,
+          ),
+        } satisfies Resolution;
+      }
+
+      return {
+        transport: createStatefulTransport(sessionIdentity),
+        created: true,
+      } satisfies Resolution;
     };
 
-    // The auth logic is now handled by the middleware. We just need to
-    // run the core RPC logic within the async-local-storage context that
-    // the middleware has already populated.
-    try {
-      const store = authContext.getStore();
-      if (store) {
-        return await authContext.run(store, handleRpc);
+    const handleRpc = async (): Promise<Response> => {
+      const resolution = resolveTransportForRequest();
+      if ('response' in resolution) {
+        return resolution.response;
       }
-      return await handleRpc();
-    } catch (err) {
-      // Only close transport on error - success path needs to keep it open
-      await transport.close?.().catch((closeErr) => {
-        logger.warning('Failed to close transport after error', {
-          ...transportContext,
-          sessionId,
-          error:
-            closeErr instanceof Error ? closeErr.message : String(closeErr),
-        });
+
+      const { transport, created } = resolution;
+
+      if (authStore?.authInfo) {
+        nodeReq.auth = authStore.authInfo;
+      } else {
+        delete nodeReq.auth;
+      }
+
+      try {
+        if (created) {
+          await mcpServer.connect(transport);
+        }
+
+        await transport.handleRequest(nodeReq, nodeRes, parsedBody);
+      } finally {
+        if (!isStatefulMode) {
+          await transport.close().catch((error) => {
+            logger.debug('Failed to close stateless transport after request.', {
+              ...transportContext,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          });
+        }
+      }
+
+      return c.newResponse(null, {
+        status: 204,
+        headers: { [HONO_ALREADY_SENT_HEADER]: 'true' },
       });
-      throw err instanceof Error ? err : new Error(String(err));
+    };
+
+    const store = authContext.getStore();
+    if (store) {
+      return await authContext.run(store, handleRpc);
     }
+    return await handleRpc();
   });
 
   logger.info('Hono application setup complete.', transportContext);
@@ -486,4 +554,31 @@ export async function stopHttpTransport(
       resolve();
     });
   });
+}
+
+function isInitializationPayload(payload: unknown): boolean {
+  if (!payload) {
+    return false;
+  }
+
+  if (Array.isArray(payload)) {
+    return payload.some((message) => isInitializeRequest(message as never));
+  }
+
+  return isInitializeRequest(payload as never);
+}
+
+function extractSessionIdentity(
+  authInfo?: AuthInfo,
+): SessionIdentity | undefined {
+  if (!authInfo) {
+    return undefined;
+  }
+
+  const identity: SessionIdentity = {};
+  if (authInfo.tenantId) identity.tenantId = authInfo.tenantId;
+  if (authInfo.clientId) identity.clientId = authInfo.clientId;
+  if (authInfo.subject) identity.subject = authInfo.subject;
+
+  return Object.keys(identity).length > 0 ? identity : undefined;
 }
