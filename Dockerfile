@@ -47,8 +47,9 @@ COPY package.json bun.lock ./
 # that are not needed in the final production image.
 RUN bun install --production --frozen-lockfile --ignore-scripts
 
-# Copy the compiled application code from the build stage
+# Copy the compiled application code (and tsconfig for Bun path resolution)
 COPY --from=build /usr/src/app/dist ./dist
+COPY --from=build /usr/src/app/tsconfig.json ./tsconfig.json
 
 # The 'oven/bun' image already provides a non-root user named 'bun'.
 # We will use this existing user for enhanced security.
@@ -77,4 +78,4 @@ ENV MCP_FORCE_CONSOLE_LOGGING="true"
 EXPOSE ${MCP_HTTP_PORT}
 
 # The command to start the server
-CMD ["bun", "run", "dist/index.js"]
+CMD ["bun", "./dist/src/index.js"]

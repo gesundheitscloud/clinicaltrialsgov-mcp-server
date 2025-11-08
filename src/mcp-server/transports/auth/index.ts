@@ -9,7 +9,6 @@ export { withRequiredScopes } from './lib/authUtils.js';
 export type { AuthInfo } from './lib/authTypes.js';
 
 export { createAuthStrategy } from './authFactory.js';
-export { createAuthMiddleware } from './authMiddleware.js';
 export type { AuthStrategy } from './strategies/authStrategy.js';
 export { JwtStrategy } from './strategies/jwtStrategy.js';
 export { OauthStrategy } from './strategies/oauthStrategy.js';

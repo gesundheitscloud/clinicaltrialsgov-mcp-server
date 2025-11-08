@@ -54,7 +54,7 @@
     "allowJs": false,
     "baseUrl": ".",
     "paths": {
-      "@/*": ["src/*"],
+      "@/*": ["src/*", "dist/src/*"],
       "tests/*": ["tests/*"]
     }
   },
