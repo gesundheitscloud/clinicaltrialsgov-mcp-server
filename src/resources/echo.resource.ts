@@ -1,4 +1,4 @@
-import { MCPResource, type ResourceContent } from 'mcp-framework';
+import { MCPResource, type ResourceContent } from '@d4l/mcp-framework';
 
 import { logger, requestContextService } from '@/utils/index.js';
 

@@ -20,7 +20,7 @@ import {
   MCPServer,
   type TransportConfig,
   type HttpStreamTransportConfig,
-} from 'mcp-framework';
+} from '@d4l/mcp-framework';
 
 import { config as appConfigType } from '@/config/index.js';
 import container, { AppConfig, composeContainer } from '@/container/index.js';

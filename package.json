@@ -118,6 +118,7 @@
     ]
   },
   "dependencies": {
+    "@d4l/mcp-framework": "^0.2.15",
     "@modelcontextprotocol/sdk": "^1.20.0",
     "@opentelemetry/api": "^1.9.0",
     "@opentelemetry/auto-instrumentations-node": "^0.65.0",
@@ -150,8 +151,7 @@
     "tslib": "^2.8.1",
     "tsyringe": "^4.10.0",
     "validator": "13.15.15",
-    "zod": "^3.23.8",
-    "mcp-framework": "^0.2.15"
+    "zod": "^3.23.8"
   },
   "devDependencies": {
     "@anatine/zod-mock": "^3.14.0",

@@ -12,7 +12,11 @@ WORKDIR /usr/src/app
 COPY package.json bun.lock ./
 
 # Install all dependencies (including dev dependencies for building)
-RUN bun install --frozen-lockfile
+RUN --mount=type=secret,id=npmrc,target=/tmp/.npmrc \
+    --mount=type=cache,id=npm,target=/root/.npm \
+    cp /tmp/.npmrc .npmrc && \
+    bun install --frozen-lockfile && \
+    rm .npmrc
 
 # Copy the rest of the source code
 COPY . .
@@ -45,7 +49,11 @@ COPY package.json bun.lock ./
 
 # Install only production dependencies, ignoring any lifecycle scripts (like 'prepare')
 # that are not needed in the final production image.
-RUN bun install --production --frozen-lockfile --ignore-scripts
+RUN --mount=type=secret,id=npmrc,target=/tmp/.npmrc \
+    --mount=type=cache,id=npm,target=/root/.npm \
+    cp /tmp/.npmrc .npmrc && \
+    bun install --production --frozen-lockfile --ignore-scripts && \
+    rm .npmrc
 
 # Copy the compiled application code (and tsconfig for Bun path resolution)
 COPY --from=build /usr/src/app/dist ./dist

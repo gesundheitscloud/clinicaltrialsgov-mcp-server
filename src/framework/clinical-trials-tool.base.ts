@@ -1,5 +1,5 @@
 import type { ContentBlock } from '@modelcontextprotocol/sdk/types.js';
-import { MCPTool } from 'mcp-framework';
+import { MCPTool } from '@d4l/mcp-framework';
 import { z, type ZodRawShape } from 'zod';
 
 import { withRequiredScopes } from '@/mcp-server/transports/auth/lib/authUtils.js';
