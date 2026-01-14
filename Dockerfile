@@ -5,6 +5,7 @@
 # source code into JavaScript, and prepares the production assets.
 # ==============================================================================
 FROM oven/bun:1 AS build
+ARG NPM_AUTH_TOKEN
 
 WORKDIR /usr/src/app
 
@@ -12,6 +13,7 @@ WORKDIR /usr/src/app
 COPY package.json bun.lock ./
 
 # Install all dependencies (including dev dependencies for building)
+ENV NPM_AUTH_TOKEN=${NPM_AUTH_TOKEN}
 RUN --mount=type=secret,id=npmrc,target=/tmp/.npmrc \
     --mount=type=cache,id=npm,target=/root/.npm \
     cp /tmp/.npmrc .npmrc && \
@@ -33,6 +35,7 @@ RUN bun run build
 # dependencies and build artifacts.
 # ==============================================================================
 FROM oven/bun:1-slim AS production
+ARG NPM_AUTH_TOKEN
 
 WORKDIR /usr/src/app
 
@@ -49,6 +52,7 @@ COPY package.json bun.lock ./
 
 # Install only production dependencies, ignoring any lifecycle scripts (like 'prepare')
 # that are not needed in the final production image.
+ENV NPM_AUTH_TOKEN=${NPM_AUTH_TOKEN}
 RUN --mount=type=secret,id=npmrc,target=/tmp/.npmrc \
     --mount=type=cache,id=npm,target=/root/.npm \
     cp /tmp/.npmrc .npmrc && \
